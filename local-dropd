@@ -10,12 +10,14 @@ watches; everything the panel wants to do arrives as one JSON line on a
 unix socket.  No third-party modules.
 """
 
+import ctypes
 import errno
 import json
 import os
 import re
 import shutil
 import socket
+import stat
 import ssl
 import struct
 import subprocess
@@ -45,6 +47,23 @@ MAX_DEVICES = 64
 # One transfer's worth of files, and the free space to keep underneath it.
 MAX_FILES_PER_SESSION = 512
 DISK_MARGIN = 256 << 20
+# Every file must declare a size in (0, MAX_FILE_BYTES], and a session's files
+# together may not exceed MAX_SESSION_BYTES. A missing or zero size used to mean
+# "unknown", which lifted the streaming cap to 8 GiB.
+MAX_FILE_BYTES = 64 << 30
+MAX_SESSION_BYTES = 256 << 30
+# How often, in bytes written, a receive re-checks the free space underneath it.
+DISK_RECHECK_BYTES = 8 << 20
+
+# Receive-server deadlines. Anyone on the network can connect, so no request
+# phase may hold a thread or socket open on the peer's schedule.
+MAX_CONNECTIONS = 16        # concurrent handlers; extra connections are closed
+IO_TIMEOUT = 20.0           # any single read or write that makes no progress
+HEADER_DEADLINE = 15.0      # accept → request line and headers complete
+BODY_DEADLINE = 20.0        # a JSON request body, start to finish
+REPLY_DEADLINE = 15.0       # writing our answer
+UPLOAD_BASE_DEADLINE = 60.0 # an upload gets this long plus...
+UPLOAD_MIN_RATE = 256 << 10 # ...one second per this many declared bytes
 STALL_TIMEOUT = 60.0
 MAX_TRANSFERS = 10
 NOTIFY_GLYPH = "󰀂"
@@ -146,16 +165,109 @@ def safe_name(raw):
     return name[:180]
 
 
-def unique_path(directory, name):
-    candidate = os.path.join(directory, name)
-    if not os.path.exists(candidate):
-        return candidate
-    stem, ext = os.path.splitext(name)
-    for i in range(1, 1000):
-        candidate = os.path.join(directory, "%s (%d)%s" % (stem, i, ext))
-        if not os.path.exists(candidate):
-            return candidate
-    return os.path.join(directory, "%s-%s%s" % (stem, uuid.uuid4().hex[:6], ext))
+# ---------------------------------------------------------------- landing files
+#
+# Received files are created and published relative to a directory fd, never by
+# path: the temporary file is opened O_CREAT|O_EXCL|O_NOFOLLOW under a random
+# name, checked to be a regular file we own, and published with an atomic
+# rename that refuses to replace anything already there. There is no
+# check-then-use window, no symlink is ever followed, and nothing that exists
+# in the download directory can be overwritten.
+
+RENAME_NOREPLACE = 1
+try:
+    _renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    _renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+    _renameat2.restype = ctypes.c_int
+except (OSError, AttributeError):
+    _renameat2 = None
+
+
+def open_save_dir(path):
+    """An fd for the download directory, which must be a directory we own."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        os.close(fd)
+        raise OSError(errno.EPERM, "download directory is not a directory owned by us")
+    return fd
+
+
+def create_temp(dir_fd):
+    """Exclusively create a fresh, unpredictable temporary file in dir_fd."""
+    name = ".localdrop-%s.part" % uuid.uuid4().hex
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o600, dir_fd=dir_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        os.close(fd)
+        os.unlink(name, dir_fd=dir_fd)
+        raise OSError(errno.EPERM, "temporary file is not a private regular file")
+    return name, fd
+
+
+def rename_noreplace(dir_fd, src, dst):
+    """Rename src to dst inside dir_fd, failing with EEXIST rather than replacing."""
+    if _renameat2 is not None:
+        if _renameat2(dir_fd, src.encode(), dir_fd, dst.encode(), RENAME_NOREPLACE) == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            raise OSError(err, os.strerror(err), dst)
+    # No renameat2 here: a hard link also refuses to replace, then drop the temp.
+    os.link(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+    os.unlink(src, dir_fd=dir_fd)
+
+
+def publish(dir_fd, temp_name, wanted):
+    """Give the temp file its real name, taking the first name not already in use."""
+    stem, ext = os.path.splitext(wanted)
+    candidates = [wanted] + ["%s (%d)%s" % (stem, i, ext) for i in range(1, 1000)]
+    candidates.append("%s-%s%s" % (stem, uuid.uuid4().hex[:8], ext))
+    for name in candidates:
+        try:
+            rename_noreplace(dir_fd, temp_name, name)
+            return name
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, "no free name for %s" % wanted)
+
+
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """A threading HTTP server that caps concurrent handlers.
+
+    A connection beyond the cap is closed at once instead of being given a
+    thread, so the number of threads and sockets a peer can hold is bounded no
+    matter how many connections it opens.
+    """
+    daemon_threads = True
+    request_queue_size = MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address):
+        # A deadline closing a socket mid-request is expected; one line, not a
+        # traceback per peer.
+        log("request from %s ended: %s" % (client_address[0], sys.exc_info()[1]))
 
 
 def guess_mime(name):
@@ -223,7 +335,10 @@ class Session:
         self.files = files            # file_id -> metadata dict
         self.tokens = {}              # file_id -> token
         self.done = set()
+        self.receiving = set()        # file ids with an upload in flight
         self.saved = []
+        self.total = sum(int(f["size"]) for f in files.values())
+        self.received = 0             # bytes written across every file so far
         self.created = time.time()
         self.progressed = time.time()
 
@@ -609,7 +724,7 @@ class Daemon:
             "files": len(files),
             "fileName": safe_name(next(iter(files.values())).get("fileName")) if files else "",
             "bytes": 0,
-            "total": sum(int(f.get("size") or 0) for f in files.values()),
+            "total": session.total,
             "status": "active",
             "error": "",
             "updated": time.time(),
@@ -973,7 +1088,7 @@ class Daemon:
         if self.http is not None:
             return True
         try:
-            server = ThreadingHTTPServer(("", self.port), make_handler(self))
+            server = BoundedHTTPServer(("", self.port), make_handler(self))
         except OSError as exc:
             self.receiving = False
             if exc.errno == errno.EADDRINUSE:
@@ -1030,10 +1145,93 @@ class Daemon:
             self.udp.close()
 
 
+class Sink:
+    """Where an upload's bytes go, and the caps they must stay under.
+
+    Whatever the framing, a file may not exceed its declared size, the session
+    may not exceed its declared total, and the disk is re-checked as it fills.
+    """
+
+    def __init__(self, handle, session, file_id, declared, handler):
+        self.handle = handle
+        self.session = session
+        self.file_id = file_id
+        self.declared = declared
+        self.handler = handler
+        self.written = 0
+        self.checked_at = 0
+
+    @property
+    def remaining(self):
+        return self.declared - self.written
+
+    def write(self, chunk):
+        size = len(chunk)
+        if self.written + size > self.declared:
+            raise OSError("body larger than the declared size")
+        if self.session.received + size > self.session.total:
+            raise OSError("transfer larger than its declared total")
+        if self.written - self.checked_at >= DISK_RECHECK_BYTES:
+            self.checked_at = self.written
+            if shutil.disk_usage(self.handler.daemon.save_dir).free < DISK_MARGIN:
+                raise OSError("download folder is nearly full")
+        self.handle.write(chunk)
+        self.written += size
+        self.session.received += size
+        self.session.progressed = time.time()
+        if self.session.id in self.handler.daemon.cancelled:
+            raise OSError("cancelled")
+        self.handler.report(self.session, self.file_id, self.written)
+
+    def finish(self):
+        if self.written != self.declared:
+            raise OSError("body shorter than the declared size")
+
+
 def make_handler(daemon):
     class Handler(BaseHTTPRequestHandler):
+        daemon = None  # set below; the Sink reaches the daemon through here
         protocol_version = "HTTP/1.1"
         server_version = "OmarchyLocalDrop/1.0"
+        # Applied by StreamRequestHandler to every recv and send on the socket:
+        # a read or write that makes no progress for this long fails.
+        timeout = IO_TIMEOUT
+
+        # ------------------------------------------------------- deadlines
+        # IO_TIMEOUT alone does not bound a request: a peer that trickles one
+        # byte at a time never trips it. Each phase therefore also gets a wall-
+        # clock deadline, and when it passes the socket is shut down, which
+        # unblocks whatever read or write the handler is sitting in.
+        def setup(self):
+            super().setup()
+            self._deadline = None
+            self.arm(HEADER_DEADLINE)
+
+        def finish(self):
+            self.disarm()
+            try:
+                super().finish()
+            except OSError:
+                pass
+
+        def arm(self, seconds):
+            self.disarm()
+            timer = threading.Timer(seconds, self.expire)
+            timer.daemon = True
+            timer.start()
+            self._deadline = timer
+
+        def disarm(self):
+            timer, self._deadline = getattr(self, "_deadline", None), None
+            if timer is not None:
+                timer.cancel()
+
+        def expire(self):
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):
             # The default logger writes a line per request to stderr, which the
@@ -1049,9 +1247,14 @@ def make_handler(daemon):
 
         def reply(self, status, payload=None):
             body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+            self.arm(REPLY_DEADLINE)
+            # One request per connection: keep-alive would hand a peer a fresh
+            # header phase on a socket whose deadlines have already been spent.
+            self.close_connection = True
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
             if body:
                 self.wfile.write(body)
@@ -1067,12 +1270,14 @@ def make_handler(daemon):
 
         # ----------------------------------------------------------- routes
         def do_GET(self):
+            self.arm(BODY_DEADLINE)
             path, _ = self.route()
             if path in ("/info", "/register"):
                 return self.reply(200, daemon.info())
             self.reply(404, {"message": "not found"})
 
         def do_POST(self):
+            self.arm(BODY_DEADLINE)
             path, query = self.route()
             if path == "/register":
                 return self.handle_register()
@@ -1109,18 +1314,25 @@ def make_handler(daemon):
                 return self.reply(400, {"message": "too many files"})
             if not all(isinstance(f, dict) for f in files.values()):
                 return self.reply(400, {"message": "malformed file list"})
-            try:
-                declared = sum(max(0, int(f.get("size") or 0)) for f in files.values())
-            except (TypeError, ValueError):
-                return self.reply(400, {"message": "malformed file size"})
+            # Every file declares a positive, bounded size. A missing or zero
+            # size used to mean "unknown", which skipped the space check and
+            # let a chunked upload stream up to 8 GiB.
+            for f in files.values():
+                size = f.get("size")
+                if isinstance(size, bool) or not isinstance(size, int) \
+                        or not 0 < size <= MAX_FILE_BYTES:
+                    return self.reply(400, {"message": "every file needs a positive size"})
+            declared = sum(f["size"] for f in files.values())
+            if declared > MAX_SESSION_BYTES:
+                return self.reply(413, {"message": "transfer too large"})
             # "Everyone" mode accepts without asking, so nothing else would stop
             # a peer from filling the disk. Leave a margin rather than running
-            # the filesystem to zero.
+            # the filesystem to zero, and fail closed if we cannot tell.
             try:
                 free = shutil.disk_usage(daemon.save_dir).free
             except OSError:
-                free = None
-            if free is not None and declared + DISK_MARGIN > free:
+                return self.reply(507, {"message": "cannot check free space"})
+            if declared + DISK_MARGIN > free:
                 log("refusing %d bytes: only %d free" % (declared, free))
                 return self.reply(507, {"message": "not enough space"})
             peer = payload.get("info") if isinstance(payload.get("info"), dict) else {}
@@ -1132,6 +1344,7 @@ def make_handler(daemon):
                 busy = daemon.session is not None
             if busy:
                 return self.reply(409, {"message": "already receiving"})
+            self.disarm()   # waiting on the user, not on the peer
             if not daemon.request_permission(peer, files):
                 return self.reply(403, {"message": "declined"})
             session = daemon.start_session(peer, files, self.client_address[0])
@@ -1154,62 +1367,79 @@ def make_handler(daemon):
 
             meta = session.files.get(file_id) or {}
             declared = int(meta.get("size") or 0)
+            if declared <= 0:
+                daemon.fail_receive(session, "file has no declared size")
+                return self.reply(400, {"message": "no declared size"})
+            with daemon.lock:
+                if file_id in session.done or file_id in session.receiving:
+                    return self.reply(409, {"message": "file already received"})
+                session.receiving.add(file_id)
+            try:
+                return self.receive_file(session, file_id, meta, declared)
+            finally:
+                with daemon.lock:
+                    session.receiving.discard(file_id)
+
+        def receive_file(self, session, file_id, meta, declared):
             chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
             length = int(self.headers.get("Content-Length") or 0)
-            # A phone streaming a photo does not know the length up front and
-            # frames the body as chunked. Refusing that was refusing the file.
-            if not chunked and length <= 0:
-                daemon.fail_receive(session, "sender supplied no body length")
-                return self.reply(400, {"message": "no body length"})
-            if not chunked and declared and length > declared + (1 << 20):
-                daemon.fail_receive(session, "body larger than the declared size")
-                return self.reply(400, {"message": "unexpected body size"})
+            # A phone streaming a photo frames the body as chunked; otherwise
+            # the length must match what was declared, byte for byte.
+            if not chunked and length != declared:
+                daemon.fail_receive(session, "body length does not match the declared size")
+                return self.reply(400, {"message": "body length does not match"})
+            self.arm(UPLOAD_BASE_DEADLINE + declared / UPLOAD_MIN_RATE)
 
-            os.makedirs(daemon.save_dir, exist_ok=True)
-            target = unique_path(daemon.save_dir, safe_name(meta.get("fileName")))
-            partial = target + ".part"
             try:
-                with open(partial, "wb") as handle:
-                    written = (self.stream_chunked(handle, session, file_id, declared)
-                               if chunked
-                               else self.stream_sized(handle, session, file_id, length))
-                os.replace(partial, target)
+                dir_fd = open_save_dir(daemon.save_dir)
             except OSError as exc:
-                try:
-                    os.unlink(partial)
-                except OSError:
-                    pass
+                daemon.fail_receive(session, "download folder unusable: %s" % exc)
+                return self.reply(500, {"message": "cannot write"})
+            temp = None
+            try:
+                temp, fd = create_temp(dir_fd)
+                with os.fdopen(fd, "wb") as handle:
+                    sink = Sink(handle, session, file_id, declared, self)
+                    if chunked:
+                        self.stream_chunked(sink)
+                    else:
+                        self.stream_sized(sink)
+                    sink.finish()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    os.fchmod(handle.fileno(), 0o644)
+                final = publish(dir_fd, temp, safe_name(meta.get("fileName")))
+                temp = None
+            except OSError as exc:
+                if temp is not None:
+                    try:
+                        os.unlink(temp, dir_fd=dir_fd)
+                    except OSError:
+                        pass
                 if str(exc) == "cancelled":
                     daemon.cancelled.discard(session.id)
                     return self.reply(403, {"message": "cancelled"})
                 daemon.fail_receive(session, str(exc))
                 return self.reply(500, {"message": "write failed"})
+            finally:
+                os.close(dir_fd)
 
             session.done.add(file_id)
-            session.saved.append(target)
-            self.report(session, file_id, written, final=True)
+            session.saved.append(os.path.join(daemon.save_dir, final))
+            self.report(session, file_id, declared, final=True)
             self.reply(200, {})
             if len(session.done) >= len(session.files):
                 daemon.finish_session(session)
 
-        def stream_sized(self, handle, session, file_id, length):
-            written = 0
-            while written < length:
-                chunk = self.rfile.read(min(256 * 1024, length - written))
+        def stream_sized(self, sink):
+            while sink.remaining > 0:
+                chunk = self.rfile.read(min(256 * 1024, sink.remaining))
                 if not chunk:
                     raise OSError("connection closed early")
-                handle.write(chunk)
-                written += len(chunk)
-                session.progressed = time.time()
-                if session.id in daemon.cancelled:
-                    raise OSError("cancelled")
-                self.report(session, file_id, written)
-            return written
+                sink.write(chunk)
 
-        def stream_chunked(self, handle, session, file_id, declared):
-            """Read an HTTP/1.1 chunked body, capped so a peer cannot fill the disk."""
-            ceiling = (declared + (1 << 20)) if declared else (8 << 30)
-            written = 0
+        def stream_chunked(self, sink):
+            """Read an HTTP/1.1 chunked body, never past the declared size."""
             while True:
                 header = self.rfile.readline(1024).strip()
                 if not header:
@@ -1217,6 +1447,8 @@ def make_handler(daemon):
                 try:
                     size = int(header.split(b";", 1)[0], 16)
                 except ValueError:
+                    raise OSError("malformed chunk header")
+                if size < 0:
                     raise OSError("malformed chunk header")
                 if size == 0:
                     # Trailers, then the closing blank line. Bounded: a peer
@@ -1228,23 +1460,18 @@ def make_handler(daemon):
                             break
                     else:
                         raise OSError("too many trailer lines")
-                    break
-                if written + size > ceiling:
+                    return
+                if size > sink.remaining:
                     raise OSError("body larger than the declared size")
                 remaining = size
                 while remaining > 0:
                     chunk = self.rfile.read(min(256 * 1024, remaining))
                     if not chunk:
                         raise OSError("connection closed mid-chunk")
-                    handle.write(chunk)
-                    written += len(chunk)
+                    sink.write(chunk)
                     remaining -= len(chunk)
-                    session.progressed = time.time()
-                    if session.id in daemon.cancelled:
-                        raise OSError("cancelled")
-                    self.report(session, file_id, written)
-                self.rfile.read(2)  # CRLF after each chunk
-            return written
+                if self.rfile.read(2) != b"\r\n":
+                    raise OSError("malformed chunk terminator")
 
         def report(self, session, file_id, written, final=False):
             now = time.time()
@@ -1277,6 +1504,7 @@ def make_handler(daemon):
             daemon.fail_receive(session, "cancelled by sender")
             self.reply(200, {})
 
+    Handler.daemon = daemon
     return Handler
 
 

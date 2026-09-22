@@ -1,5 +1,24 @@
 # Test harness
 
+## Automated receiver checks
+
+```bash
+./tests/check-receiver
+```
+
+Launches the daemon in a throwaway sandbox (its own HOME, config, runtime and
+download directory, on port 53318) and asserts the properties the security
+review asked for, printing PASS/FAIL per check and exiting non-zero on any
+failure. It never touches your real download folder or the running daemon.
+
+It covers: request-phase deadlines (an idle connection is closed on its own),
+a bounded handler-thread count under many connections, strict declared-size
+validation (missing/zero/negative/non-integer/oversized sizes and body lengths
+that do not match are all refused), safe landing (an existing file is never
+overwritten and a symlink is never followed), and a normal byte-identical
+sized and chunked upload.
+
+
 Two scripts stand in for the second device, so every path can be exercised on
 one machine. Neither touches the network beyond the local subnet.
 
