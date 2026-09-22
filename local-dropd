@@ -130,6 +130,19 @@ def clean_text(value, limit=200):
     return text[:limit]
 
 
+def header_int(value, default=0):
+    """Parse a numeric header, treating anything non-numeric as the default.
+
+    A peer can send Content-Length: garbage; int() on it would raise out of the
+    request handler. Bad input is not a body length, so it becomes the default.
+    """
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return n if n >= 0 else default
+
+
 def notify(headline, description="", urgency="low"):
     if not shutil.which("omarchy-notification-send"):
         return
@@ -1169,15 +1182,19 @@ class Sink:
         size = len(chunk)
         if self.written + size > self.declared:
             raise OSError("body larger than the declared size")
-        if self.session.received + size > self.session.total:
-            raise OSError("transfer larger than its declared total")
+        # session.received is shared: several files of one session may upload at
+        # once, so the read-check-update of the running total is done under the
+        # daemon lock. Per-file size is single-threaded (one handler per file).
+        with self.handler.daemon.lock:
+            if self.session.received + size > self.session.total:
+                raise OSError("transfer larger than its declared total")
+            self.session.received += size
         if self.written - self.checked_at >= DISK_RECHECK_BYTES:
             self.checked_at = self.written
             if shutil.disk_usage(self.handler.daemon.save_dir).free < DISK_MARGIN:
                 raise OSError("download folder is nearly full")
         self.handle.write(chunk)
         self.written += size
-        self.session.received += size
         self.session.progressed = time.time()
         if self.session.id in self.handler.daemon.cancelled:
             raise OSError("cancelled")
@@ -1260,12 +1277,14 @@ def make_handler(daemon):
                 self.wfile.write(body)
 
         def read_json(self, limit=4 << 20):
-            length = int(self.headers.get("Content-Length") or 0)
+            length = header_int(self.headers.get("Content-Length"))
             if length <= 0 or length > limit:
                 return None
             try:
+                # Broad: a deeply nested body raises RecursionError, oversize
+                # decodes raise MemoryError — neither is a valid body.
                 return json.loads(self.rfile.read(length).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except Exception:
                 return None
 
         # ----------------------------------------------------------- routes
@@ -1382,7 +1401,7 @@ def make_handler(daemon):
 
         def receive_file(self, session, file_id, meta, declared):
             chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
-            length = int(self.headers.get("Content-Length") or 0)
+            length = header_int(self.headers.get("Content-Length"))
             # A phone streaming a photo frames the body as chunked; otherwise
             # the length must match what was declared, byte for byte.
             if not chunked and length != declared:

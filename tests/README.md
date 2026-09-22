@@ -18,6 +18,16 @@ that do not match are all refused), safe landing (an existing file is never
 overwritten and a symlink is never followed), and a normal byte-identical
 sized and chunked upload.
 
+Two extras for differential testing against an older build:
+
+```bash
+./tests/check-receiver /path/to/old/local-dropd   # run the checks against another daemon
+CHECKS=landing ./tests/check-receiver <daemon>     # run only one group, in isolation
+```
+
+Pointed at the pre-fix commit these checks fail where the new build passes —
+that is how each fix was shown to close a real gap rather than only asserted.
+
 
 Two scripts stand in for the second device, so every path can be exercised on
 one machine. Neither touches the network beyond the local subnet.

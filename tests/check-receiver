@@ -34,7 +34,8 @@ import time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DAEMON = os.path.join(os.path.dirname(HERE), "local-dropd")
+DAEMON = (sys.argv[1] if len(sys.argv) > 1
+          else os.path.join(os.path.dirname(HERE), "local-dropd"))
 HOST, PORT = "127.0.0.1", 53318
 
 failures = []
@@ -290,20 +291,41 @@ def check_landing(downloads):
           kept == b"ORIGINAL" and (st, up) == (200, 200) and len(landed) >= 2,
           "content=%r names=%s" % (kept, landed))
 
-    # (2) A symlink with the target name must not be followed.
+    # (2) A symlink at the FINAL name must not be followed. Both the old and
+    # new code sidestep this via name-collision handling, so it is a property
+    # test, not a discriminator.
     outside = os.path.join(downloads, "..", "secret.txt")
     with open(outside, "wb") as f:
         f.write(b"SECRET")
     link = os.path.join(downloads, "link.bin")
     os.symlink(os.path.abspath(outside), link)
     st, up = send_one("link.bin", b"ATTACKER-CONTROLLED")
-    with open(outside, "rb") as f:
-        secret = f.read()
-    link_ok = os.path.islink(link)
-    check("landing: symlink not followed, target untouched",
-          secret == b"SECRET" and link_ok and (st, up) == (200, 200),
-          "target=%r link_still_symlink=%s" % (secret, link_ok))
+    secret = open(outside, "rb").read()
+    check("landing: symlink at final name not followed",
+          secret == b"SECRET" and os.path.islink(link) and (st, up) == (200, 200),
+          "target=%r" % secret)
+    os.unlink(link)
     os.unlink(outside)
+
+    # (3) THE decisive one for finding #3: a symlink pre-placed at the temporary
+    # "<name>.part" path. The old code opened <target>.part with "wb", which
+    # follows the symlink and truncates whatever it points at. The new code
+    # writes to a random O_EXCL|O_NOFOLLOW temp, so the pointed-at file is safe.
+    victim = os.path.join(downloads, "..", "victim.txt")
+    with open(victim, "wb") as f:
+        f.write(b"VICTIM-DATA")
+    part_link = os.path.join(downloads, "boobytrap.bin.part")
+    os.symlink(os.path.abspath(victim), part_link)
+    st, up = send_one("boobytrap.bin", b"OVERWRITE-ATTEMPT-PAYLOAD")
+    victim_after = open(victim, "rb").read()
+    check("landing: symlink at <name>.part does not truncate its target",
+          victim_after == b"VICTIM-DATA",
+          "victim now %r (prepare=%s upload=%s)" % (victim_after, st, up))
+    for pth in (part_link, victim):
+        try:
+            os.unlink(pth)
+        except OSError:
+            pass
 
     # (3) No temporary .part files left behind.
     leftovers = [n for n in os.listdir(downloads) if ".part" in n or n.startswith(".localdrop")]
@@ -358,11 +380,23 @@ def main():
         proc, downloads = start_daemon(sandbox)
         daemon_pid = proc.pid
         print("daemon up in sandbox %s\n" % sandbox, flush=True)
-        print("sizes:", flush=True);    check_sizes()
-        print("landing:", flush=True);  check_landing(downloads)
-        print("normal:", flush=True);   check_normal(downloads)
-        print("cap:", flush=True);      check_cap(daemon_pid)
-        print("deadline (waits ~%gs):" % HEADER_WAIT, flush=True); check_deadline()
+        # CHECKS=landing,sizes limits the run to those groups; default is all.
+        # Running a single group in isolation matters for differential testing
+        # against the old code, whose single stuck session otherwise masks the
+        # later groups behind 409s.
+        want = os.environ.get("CHECKS")
+        groups = set(want.split(",")) if want else None
+        def run(name, fn):
+            if groups is None or name in groups:
+                print("%s:" % name, flush=True)
+                fn()
+        run("sizes", check_sizes)
+        run("landing", lambda: check_landing(downloads))
+        run("normal", lambda: check_normal(downloads))
+        run("cap", lambda: check_cap(daemon_pid))
+        if groups is None or "deadline" in groups:
+            print("deadline (waits ~%gs):" % HEADER_WAIT, flush=True)
+            check_deadline()
     finally:
         if proc:
             proc.send_signal(signal.SIGTERM)
