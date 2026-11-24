@@ -22,6 +22,7 @@ Item {
   property real askTimeout: 60
   property string daemonError: ""
   property var devices: []
+  property var favorites: []
   property var transfers: []
   property var incoming: null
   property string actionStatus: ""
@@ -53,6 +54,7 @@ Item {
       askTimeout = Number(state.askTimeout || 60)
       daemonError = String(state.error || "")
       devices = state.devices || []
+      favorites = state.favorites || []
       transfers = state.transfers || []
       incoming = state.incoming || null
     } catch (e) {
@@ -76,6 +78,15 @@ Item {
   }
 
   function setMode(mode) { enqueue(["mode", mode]) }
+  function isFavorite(fingerprint) {
+    for (var i = 0; i < favorites.length; i++)
+      if (String(favorites[i]) === String(fingerprint)) return true
+    return false
+  }
+  function toggleFavorite(fingerprint) {
+    var value = String(fingerprint || "")
+    if (value !== "") enqueue([isFavorite(value) ? "unfavorite" : "favorite", value])
+  }
   function toggleReceiving() { setMode(receiveMode === "off" ? "ask" : "off") }
   function announce() { enqueue(["announce"]) }
   function cancelTransfer(id) { enqueue(["cancel", String(id || "")]) }

@@ -19,6 +19,8 @@ The checks:
             untouched and lands beside it; a symlink in the folder is never
             followed and its target is left untouched; no .part files remain
   normal    a plain sized upload and a chunked upload land byte-identical
+  favorites a favorited fingerprint is accepted without asking, any other
+            sender still gets the accept card, and unfavorite removes it
 """
 
 import http.client
@@ -50,12 +52,13 @@ def check(name, ok, detail=""):
 
 # --------------------------------------------------------------- HTTP helpers
 
-def prepare(files, info_alias="Checker"):
+def prepare(files, info_alias="Checker", fingerprint=None, timeout=30):
     body = {"info": {"alias": info_alias, "version": "2.1", "deviceModel": "Test",
-                     "deviceType": "desktop", "fingerprint": uuid.uuid4().hex * 2,
+                     "deviceType": "desktop",
+                     "fingerprint": fingerprint or uuid.uuid4().hex * 2,
                      "port": 53399, "protocol": "http", "download": False},
             "files": files}
-    conn = http.client.HTTPConnection(HOST, PORT, timeout=30)
+    conn = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
     conn.request("POST", "/api/localsend/v2/prepare-upload",
                  body=json.dumps(body).encode(),
                  headers={"Content-Type": "application/json"})
@@ -353,6 +356,57 @@ def check_normal(downloads):
           "; ".join(detail))
 
 
+def check_favorites(runtime):
+    """A favorited fingerprint skips the accept card; any other sender asks."""
+
+    def ctl(message):
+        path = os.path.join(runtime, "omarchy-local-drop", "control.sock")
+        for _ in range(50):
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect(path)
+                break
+            except OSError:
+                sock.close()
+                time.sleep(0.1)
+        else:
+            raise SystemExit("control socket never appeared at %s" % path)
+        with sock:
+            sock.sendall((json.dumps(message) + "\n").encode())
+            chunks = []
+            while b"\n" not in b"".join(chunks):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        return json.loads(b"".join(chunks).split(b"\n", 1)[0])
+
+    favorite_fp = uuid.uuid4().hex * 2
+    ctl({"cmd": "mode", "mode": "ask"})
+    ctl({"cmd": "favorite", "fingerprint": favorite_fp})
+    files, ids = make_files([("favorite.bin", 5)])
+    st, body = prepare(files, fingerprint=favorite_fp)
+    up = None
+    if st == 200 and body:
+        up = upload_sized(body["sessionId"], ids[0], body["files"][ids[0]], b"hello")
+    check("favorites: a favorite sender is accepted without asking",
+          (st, up) == (200, 200), "prepare=%s upload=%s" % (st, up))
+
+    try:
+        prepare(make_files([("ask.bin", 5)])[0],
+                fingerprint=uuid.uuid4().hex * 2, timeout=3)
+        asked = False
+    except OSError:
+        asked = True
+    check("favorites: an unfavorited sender still gets the accept card", asked)
+    ctl({"cmd": "respond", "accept": False})   # release the parked request
+    ctl({"cmd": "unfavorite", "fingerprint": favorite_fp})
+    state = ctl({"cmd": "status"}).get("state") or {}
+    check("favorites: unfavorite removes it from the list", state.get("favorites") == [],
+          "favorites=%r" % state.get("favorites"))
+
+
 # ------------------------------------------------------------ constants pulled from the daemon
 
 def load_constants():
@@ -393,6 +447,7 @@ def main():
         run("sizes", check_sizes)
         run("landing", lambda: check_landing(downloads))
         run("normal", lambda: check_normal(downloads))
+        run("favorites", lambda: check_favorites(os.path.join(sandbox, "run")))
         run("cap", lambda: check_cap(daemon_pid))
         if groups is None or "deadline" in groups:
             print("deadline (waits ~%gs):" % HEADER_WAIT, flush=True)

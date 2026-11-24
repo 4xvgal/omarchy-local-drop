@@ -9,6 +9,7 @@ Usage:
   local-drop-ctl accept [sessionId] | decline [sessionId]
   local-drop-ctl cancel <transferId>
   local-drop-ctl mode <off|ask|auto>
+  local-drop-ctl favorite <fingerprint> | unfavorite <fingerprint>
   local-drop-ctl alias <name>
   local-drop-ctl announce | clear | quit
 """
@@ -62,6 +63,10 @@ def build(argv):
         if not rest:
             raise SystemExit("usage: local-drop-ctl mode <off|ask|auto>")
         return {"cmd": "mode", "mode": rest[0]}
+    if command in ("favorite", "unfavorite"):
+        if not rest:
+            raise SystemExit("usage: local-drop-ctl %s <fingerprint>" % command)
+        return {"cmd": command, "fingerprint": rest[0]}
     if command == "alias":
         if not rest:
             raise SystemExit("usage: local-drop-ctl alias <name>")

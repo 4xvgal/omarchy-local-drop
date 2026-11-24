@@ -18,7 +18,9 @@ var GLYPH = {
   failed: String.fromCodePoint(0xf0156),
   stop: String.fromCodePoint(0xf0156),
   refresh: String.fromCodePoint(0xf0450),
-  folder: String.fromCodePoint(0xf0770)
+  folder: String.fromCodePoint(0xf0770),
+  star: String.fromCodePoint(0xf04ce),
+  starOutline: String.fromCodePoint(0xf04d2)
 }
 
 function deviceGlyph(type) {

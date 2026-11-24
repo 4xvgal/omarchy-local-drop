@@ -498,6 +498,15 @@ Panel {
         }
 
         ActionChip {
+          // Accept this one, and every later transfer from the same sender.
+          label: "Always"
+          onActivated: {
+            service.toggleFavorite(String(service.incoming.fingerprint || ""))
+            service.respond(true)
+          }
+        }
+
+        ActionChip {
           label: "Decline"
           onActivated: service.respond(false)
         }
@@ -545,6 +554,9 @@ Panel {
     id: deviceRow
     property var device: null
     property int rowIndex: 0
+
+    // Favourite senders skip the accept card; the star toggles that.
+    readonly property bool favorite: service.isFavorite(device ? device.fingerprint : "")
 
     hasCursor: root.cursorActive && root.cursorIndex === rowIndex
     foreground: root.foreground
@@ -599,6 +611,15 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+
+      PanelActionButton {
+        iconText: deviceRow.favorite ? Model.GLYPH.star : Model.GLYPH.starOutline
+        tooltipText: deviceRow.favorite ? "Remove from favorites" : "Always accept from this device"
+        foreground: deviceRow.favorite ? root.accent : root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: service.toggleFavorite(deviceRow.device ? deviceRow.device.fingerprint : "")
       }
 
       PanelActionButton {

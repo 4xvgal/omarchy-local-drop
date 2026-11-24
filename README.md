@@ -23,6 +23,7 @@ LocalSend on the phone will.
 | Send files | Click a device → the file chooser opens → pick files |
 | Send the clipboard | The clipboard button on a device row (image if the clipboard holds one, otherwise text) |
 | Accept an incoming transfer | `Accept` on the card (or press `a`) |
+| Favorite a device | The star on its row, or `Always` on its incoming card |
 | Turn receiving on/off | The switch in the header, or right-click the bar icon |
 | Look for devices again | The ↻ button, or middle-click the bar icon |
 | Open the save folder | The folder button next to `TRANSFERS` |
@@ -39,6 +40,14 @@ Keys while the panel is open: `j`/`k` or arrows to move, `Enter` to send,
   file names and the size. Nothing is written until you accept; the sender
   waits up to 60 seconds.
 - **Everyone** — anything nearby can drop files straight into `~/Downloads`.
+
+Favorites are the middle ground: star a device in the nearby list (or press
+`Always` on one of its cards) and its later transfers skip the card while every
+other device still asks. A starred row shows a filled star in the accent
+color; click it again to go back to asking. The list lives in `favorites` in
+`~/.config/omarchy/local-drop.json`; `./local-drop-ctl unfavorite <fingerprint>`
+removes an entry. A sender asserts its own fingerprint, so favorites are
+convenience, not authentication — keep **Ask first** on café Wi-Fi.
 
 Files land in your XDG download directory, and an existing name is never
 overwritten — a second `report.pdf` is saved as `report (1).pdf`.
@@ -68,6 +77,8 @@ cd ~/.config/omarchy/plugins/io.github.metachow.local-drop
 ./local-drop-ctl send <fingerprint> a.png    # fingerprints come from `devices`
 ./local-drop-ctl send-clipboard <fingerprint>
 ./local-drop-ctl mode ask                    # off | ask | auto
+./local-drop-ctl favorite <fingerprint>      # never ask for this device again
+./local-drop-ctl unfavorite <fingerprint>    # ask again
 ./local-drop-ctl alias "Zhou's Laptop"       # rename this machine
 ```
 

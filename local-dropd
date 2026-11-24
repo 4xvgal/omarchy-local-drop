@@ -320,6 +320,11 @@ class Config:
         if self.data.get("receiveMode") not in ("off", "ask", "auto"):
             self.data["receiveMode"] = "ask"
             changed = True
+        # Fingerprints that skip the accept card. A sender asserts its own
+        # fingerprint, so this is convenience, not authentication.
+        if not isinstance(self.data.get("favorites"), list):
+            self.data["favorites"] = []
+            changed = True
         if changed:
             self.save()
 
@@ -393,6 +398,10 @@ class Daemon:
     def mode(self):
         return self.config.get("receiveMode", "ask")
 
+    @property
+    def favorites(self):
+        return self.config.get("favorites") or []
+
     def info(self, announce=None):
         payload = {
             "alias": self.alias,
@@ -421,6 +430,7 @@ class Daemon:
                 "fingerprint": self.fingerprint,
                 "port": self.port,
                 "receiveMode": self.mode,
+                "favorites": self.favorites,
                 "askTimeout": ASK_TIMEOUT,
                 "receiving": self.receiving,
                 "saveDir": self.save_dir,
@@ -666,7 +676,8 @@ class Daemon:
             return False
         total = sum(int(f.get("size") or 0) for f in files.values())
         names = [safe_name(f.get("fileName")) for f in files.values()]
-        if self.mode == "auto":
+        fingerprint = str(peer.get("fingerprint") or "")
+        if self.mode == "auto" or (fingerprint and fingerprint in self.favorites):
             notify("Receiving %d file%s" % (len(files), "" if len(files) == 1 else "s"),
                    "From %s" % peer.get("alias", "a device"))
             return True
@@ -675,6 +686,7 @@ class Daemon:
                 return False
             self.incoming = {
                 "sessionId": uuid.uuid4().hex,
+                "fingerprint": str(peer.get("fingerprint") or "")[:128],
                 "alias": peer.get("alias", "Unknown device"),
                 "deviceType": peer.get("deviceType", "desktop"),
                 "fileCount": len(files),
@@ -1009,6 +1021,16 @@ class Daemon:
             result = self.resolve_incoming(str(message.get("sessionId") or ""),
                                            bool(message.get("accept")))
             return {"ok": result == "ok", "message": result}
+        if command in ("favorite", "unfavorite"):
+            fingerprint = str(message.get("fingerprint") or "")[:128]
+            if not fingerprint:
+                return {"ok": False, "message": "fingerprint required"}
+            favorites = [f for f in self.favorites if f != fingerprint]
+            if command == "favorite":
+                favorites.append(fingerprint)
+            self.config.set("favorites", favorites)
+            self.publish()
+            return {"ok": True, "message": fingerprint}
         if command == "mode":
             mode = str(message.get("mode") or "")
             if mode not in ("off", "ask", "auto"):
